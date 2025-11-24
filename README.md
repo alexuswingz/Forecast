@@ -1,199 +1,183 @@
-# The 1000 Bananas Backend
+# Amazon Forecast Backend
 
-Backend system for Amazon SP-API and Ads API data synchronization and metrics reporting.
+> Production-ready backend system for Amazon Seller analytics, forecasting, and reporting with AWS Lambda integration
 
-## 📁 Project Structure
+[![GitHub](https://img.shields.io/badge/GitHub-alexuswingz%2FForecast-blue)](https://github.com/alexuswingz/Forecast.git)
 
-```
-The1000backend/
-├── 📄 Core Application Files
-│   ├── config.py              # Configuration and environment variables
-│   ├── database.py            # Database connection setup
-│   ├── models.py              # SQLAlchemy ORM models
-│   ├── main.py                # FastAPI application entry point
-│   ├── data_sync.py           # Data synchronization orchestrator
-│   ├── scheduler.py           # Scheduled job manager
-│   ├── requirements.txt       # Python dependencies
-│   └── .env                   # Environment variables (not in git)
-│
-├── 🗄️ Database
-│   └── kpi_metrics.db         # SQLite database (dev only)
-│
-├── 🔌 integrations/           # API Integration modules
-│   ├── amazon_sp_api.py       # Amazon Selling Partner API client
-│   └── amazon_ads_api.py      # Amazon Advertising API client
-│
-├── 📥 importers/              # Data import scripts
-│   ├── import_ads_report.py
-│   ├── import_awd_inventory_report.py
-│   ├── import_fba_inventory_report.py
-│   ├── import_fulfillment_shipments.py
-│   ├── import_inventory_ledger.py
-│   ├── import_products_and_cogs.py
-│   └── sync_child_daily.py
-│
-├── 🛠️ scripts/               # Utility and maintenance scripts
-│   ├── build_hydrangea_metrics.py
-│   ├── check_hydrangea_orders.py
-│   ├── db_summary.py
-│   ├── export_hydrangea_from_rds.py
-│   ├── export_hydrangea_to_excel.py
-│   ├── fetch_settlement_reports.py
-│   ├── find_hydrangea_skus_2025.py
-│   ├── link_asins.py
-│   ├── migrate_sqlite_to_postgres.py
-│   ├── migrate_sqlite_to_rds.ps1
-│   ├── run_sql.py
-│   ├── show_config.py
-│   ├── sync_child_daily.py
-│   └── sync_to_rds.py
-│
-├── 🔄 batch_scripts/         # Windows batch automation
-│   ├── import_and_link.bat
-│   └── import_and_link_fast.bat
-│
-├── 📊 data/                  # Source data files
-│   ├── source/               # Original data files
-│   │   ├── Data Bing Bong KPIs_Metrics (2).xlsx
-│   │   ├── Sponsored_Products_Advertised_product_report (1).xlsx
-│   │   └── [Other source files]
-│   └── Fulfillment reports/  # Amazon fulfillment CSV reports
-│
-├── 📈 reports/               # Generated output reports
-│   ├── Hydrangea_Weekly_Metrics_from_RDS.xlsx
-│   ├── Hydrangea_Weekly_Metrics.xlsx
-│   └── [Other generated reports]
-│
-├── 📋 logs/                  # Application logs
-│   ├── ads_import.log
-│   ├── fulfillment_import.log
-│   ├── migration.log
-│   └── rds_sync.log
-│
-├── 💾 raw_exports/           # Raw API response cache
-│   └── [JSON/TSV files from Amazon APIs]
-│
-└── 📚 docs/                  # Documentation
-    ├── README.md             # This file
-    ├── START_HERE.md         # Quick start guide
-    ├── WALKTHROUGH.md        # Detailed setup walkthrough
-    ├── QUICK_START.md        # Quick reference
-    └── DBEAVER_SETUP.md      # Database viewer setup
-```
+## 🚀 Features
 
-## 🚀 Quick Start
+- **Excel-Accurate Forecasting Engine** - Python implementation matching Excel AUTOFORECAST formulas
+- **AWS Lambda API** - RESTful endpoints for charts, metrics, and forecasts
+- **PostgreSQL RDS Integration** - Scalable data storage with daily metrics aggregation
+- **Adjustable Velocity Weights** - Real-time forecast tuning via API parameters
+- **Clickable Metrics Dashboard** - Interactive sales, ads, and traffic metrics
+- **Weekly Metrics Endpoint** - Gregorian calendar-based reporting
+- **Amazon SP-API & Ads API** - Automated data sync from Amazon
 
-### 1. Install Dependencies
+## 📊 Key Components
+
+### 1. Forecasting Engine (`forecasting/`)
+Excel-accurate forecasting with:
+- Peak envelope smoothing
+- Weighted moving averages (11-week pyramid)
+- Seasonal patterns & velocity adjustments
+- Visual output with charts
+
+### 2. Lambda Functions (`lambda_forecast/`)
+Production API endpoints:
+- `/chart/{asin}` - Forecast chart data with adjustable weights
+- `/sales-chart/{asin}` - Sales metrics (units, revenue, sessions, conversion)
+- `/ads-chart/{asin}` - Advertising metrics (spend, ACOS, TACOS, clicks)
+- `/weekly-metrics/{asin}` - Weekly aggregated data by year
+- `/forecast` - Product forecasting data
+- `/products` - Product management
+
+### 3. Data Importers (`importers/`)
+- Fulfillment shipments
+- Ads reports
+- Inventory ledgers
+- Child traffic metrics
+- Daily metrics aggregation
+
+### 4. Database Scripts (`scripts/`)
+- Daily metrics updates
+- Forecast table creation
+- Data migration to RDS
+- Product status management
+
+## 🛠️ Setup
+
+### Prerequisites
 ```bash
-pip install -r requirements.txt
+- Python 3.8+
+- PostgreSQL (local or RDS)
+- AWS credentials (for Lambda deployment)
 ```
 
-### 2. Configure Environment
-Copy `.env.example` to `.env` and fill in your credentials:
-- Amazon SP-API credentials
-- Amazon Ads API credentials
-- RDS PostgreSQL credentials (production)
-
-### 3. Import Data
+### Installation
 ```bash
-# Import fulfillment reports
-python importers/import_fulfillment_shipments.py --folder "data/Fulfillment reports"
+# Clone repository
+git clone https://github.com/alexuswingz/Forecast.git
+cd Forecast
 
-# Import ads data
-python importers/import_ads_report.py --input "data/source/Sponsored_Products_Advertised_product_report (1).xlsx"
+# Install dependencies
+pip install -r forecasting/requirements.txt
 
-# Import products and COGS
-python importers/import_products_and_cogs.py
-
-# Link ASINs across all tables
-python scripts/link_asins.py
+# Configure database
+cp config.py.example config.py
+# Edit config.py with your database credentials
 ```
 
-### 4. Generate Reports
-```bash
-# Generate hydrangea weekly metrics from RDS
-python scripts/export_hydrangea_from_rds.py
+### Configuration
+Edit `config.py`:
+```python
+DB_HOST = 'your-rds-endpoint.amazonaws.com'
+DB_NAME = 'postgres'
+DB_USER = 'postgres'
+DB_PASSWORD = 'your-password'
 ```
 
-### 5. Sync to RDS (Production)
+## 📈 Usage
+
+### Generate Forecast
 ```bash
-# Sync SQLite data to RDS PostgreSQL
-python scripts/sync_to_rds.py --drop-first
+# Run forecasting for an ASIN
+cd forecasting
+python generate_forecast.py B0BRTK1P8Z
+
+# With visualization
+run_forecast_with_charts.bat
 ```
 
-## 📊 Database
-
-### Development (SQLite)
-- File: `kpi_metrics.db`
-- Location: Project root
-- Size: ~500 MB (1.5M+ rows)
-
-### Production (RDS PostgreSQL)
-- Host: `forecast.cf6s2y8ae04j.ap-southeast-2.rds.amazonaws.com`
-- Database: `kpi_metrics`
-- Tables: products, product_cogs, order_items, inventory_snapshots, child_traffic_metrics, ad_product_performance, settlement_transactions
-
-## 📈 Available Metrics
-
-### Hydrangea Product Metrics (Weekly)
-- **Sales**: Total revenue, units sold
-- **Traffic**: Sessions, conversion rate (organic + ads)
-- **Ads**: Spend, TACOS, CPC, impressions, clicks
-- **Inventory**: Total, Available, Reserved, Inbound (Working/Shipped/Receiving), FBA, AWD
-
-### Data Coverage
-- **Orders**: May 2024 - Nov 2025 (971,637 records)
-- **Ads**: Aug 2025 - Nov 2025 (163,339 records)
-- **Inventory**: May 2024 - Nov 2025 (382,613 snapshots)
-- **Traffic**: May 2024 - Nov 2025 (8,945 child metrics)
-
-## 🔄 Daily Automation
-
-The system supports automated daily data pulls:
-
+### Update Daily Metrics
 ```bash
-# Daily child traffic metrics
-python importers/sync_child_daily.py
-
-# Daily settlement reports
-python scripts/fetch_settlement_reports.py
+python scripts/update_daily_metrics.py
 ```
 
-## 🛠️ Useful Commands
-
+### Deploy Lambda
 ```bash
-# Check database summary
-python scripts/db_summary.py
-
-# Run custom SQL query
-python scripts/run_sql.py --sql "SELECT COUNT(*) FROM order_items"
-
-# Show current configuration
-python scripts/show_config.py
-
-# Link ASINs across tables
-python scripts/link_asins.py
+cd lambda_forecast
+# Package and upload forecast-lambda.zip to AWS Lambda
 ```
 
 ## 📚 Documentation
 
-- **[START_HERE.md](docs/START_HERE.md)** - Begin here for setup
-- **[WALKTHROUGH.md](docs/WALKTHROUGH.md)** - Detailed step-by-step guide
-- **[QUICK_START.md](docs/QUICK_START.md)** - Quick reference
-- **[DBEAVER_SETUP.md](docs/DBEAVER_SETUP.md)** - Database viewer setup
+- [API Documentation](API_README.md) - Complete API reference
+- [Forecast Calculations](CALCULATIONS.md) - Formula documentation
+- [Excel Formula Comparison](EXCEL_V1.1_VS_V1.2_COMPARISON.md) - Formula accuracy verification
+- [Clickable Metrics Guide](lambda_forecast/CLICKABLE_METRICS_GUIDE.md) - Frontend integration
+- [Lambda Deployment](lambda_forecast/DEPLOYMENT.txt) - AWS deployment guide
+
+## 🔄 Data Flow
+
+```
+Amazon APIs → Data Importers → PostgreSQL RDS
+                                      ↓
+                               Daily Metrics
+                                      ↓
+                            Forecasting Engine
+                                      ↓
+                              Lambda API Endpoints
+                                      ↓
+                               Frontend Dashboard
+```
+
+## 🎯 Key Endpoints
+
+### Forecast Chart (with adjustable weights)
+```
+GET /chart/B0BRTK1P8Z?sales_velocity_weight=0.30&sv_velocity_weight=0.20
+```
+
+### Sales Metrics
+```
+GET /sales-chart/B0BRTK1P8Z?start_date=2024-01-01&end_date=2024-12-31
+```
+
+### Weekly Metrics
+```
+GET /weekly-metrics/B0BRTK1P8Z?year=2024
+```
+
+## 📊 Database Schema
+
+### Main Tables
+- `daily_product_metrics` - Aggregated daily data per ASIN
+- `order_items` - Fulfillment data
+- `ad_product_performance` - Advertising metrics
+- `child_traffic_metrics` - Sessions & conversion
+- `weekly_forecast_metrics` - Pre-computed forecasts
+- `products` - Product catalog
+
+## 🧪 Data Status
+
+Check current data:
+```bash
+python scripts/check_data_status.py
+```
+
+Latest status (as of Nov 18, 2025):
+- Latest data: November 14, 2025
+- Total ASINs: 768
+- Total metrics: 136,347 rows
+- Days behind: 4
 
 ## 🔐 Security
 
-- Never commit `.env` file (contains API credentials)
-- RDS credentials are stored in environment variables only
-- Raw API responses are cached locally for debugging
+Sensitive data excluded from repository:
+- Fulfillment reports
+- Raw data exports
+- Customer information
+- API credentials (use environment variables)
 
-## 📞 Support
+## 📝 License
 
-For issues or questions, check the documentation in the `docs/` folder.
+Private repository - All rights reserved
+
+## 🤝 Contributing
+
+This is a private project. For access or questions, contact the repository owner.
 
 ---
 
-**Last Updated**: November 2025  
-**Version**: 1.0  
-**Status**: Production Ready ✅
+**Built with** ❤️ **for Amazon Seller Analytics**
