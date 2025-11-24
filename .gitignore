@@ -65,6 +65,12 @@ forecasting/output/
 Fulfillment reports/
 fulfillment_reports/
 
+# Raw data exports (sensitive)
+raw_exports/
+data/source/
+reports/*.xlsx
+reports/*.csv
+
 # Lambda deployment
 lambda_forecast/forecast-lambda.zip
 
