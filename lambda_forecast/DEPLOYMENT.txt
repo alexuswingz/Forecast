@@ -1,0 +1,154 @@
+DEPLOYMENT INSTRUCTIONS
+=======================
+
+1. CREATE ZIP FILE
+------------------
+zip -r forecast-lambda.zip lambda_function.py
+
+
+2. UPLOAD TO AWS LAMBDA
+-----------------------
+- Go to AWS Lambda Console
+- Create new function or select existing
+- Upload forecast-lambda.zip
+- Set Runtime: Python 3.9
+
+
+3. ADD PSYCOPG2 LAYER
+---------------------
+- In Lambda function configuration
+- Add Layer -> Custom layers
+- Select your existing psycopg2 layer
+
+
+4. SET ENVIRONMENT VARIABLES
+-----------------------------
+Configuration -> Environment variables -> Edit
+
+Add these variables:
+- DB_HOST: forecast.cf6s2y8ae04j.ap-southeast-2.rds.amazonaws.com
+- DB_PORT: 5432
+- DB_NAME: kpi_metrics
+- DB_USER: postgres
+- DB_PASSWORD: [your password]
+
+IMPORTANT - Lambda Configuration:
+- Memory: 512 MB (minimum)
+- Timeout: 60 seconds (CRITICAL for /metrics and /planning endpoints)
+- Concurrent executions: 10
+
+CRITICAL - Database Indexes (REQUIRED):
+Run ADD_INDEXES.sql on your RDS database to add performance indexes.
+Without these indexes, queries will timeout!
+
+Connect to RDS:
+psql -h forecast.cf6s2y8ae04j.ap-southeast-2.rds.amazonaws.com -U postgres -d kpi_metrics
+
+Then run:
+\i ADD_INDEXES.sql
+
+
+5. CONFIGURE API GATEWAY
+-------------------------
+Create REST API with these routes:
+
+GET  /products           -> Lambda: forecast-lambda
+GET  /planning           -> Lambda: forecast-lambda
+GET  /product/{asin}     -> Lambda: forecast-lambda
+GET  /forecast/{asin}    -> Lambda: forecast-lambda
+GET  /chart/{asin}       -> Lambda: forecast-lambda
+GET  /sales-chart/{asin} -> Lambda: forecast-lambda
+GET  /ads-chart/{asin}   -> Lambda: forecast-lambda
+GET  /metrics/{asin}     -> Lambda: forecast-lambda
+
+Enable CORS on all routes.
+
+
+6. TEST ENDPOINTS
+-----------------
+GET /products
+Response: {"products": [...]}
+
+GET /planning?page=1&limit=50
+Response: {
+  "products": [{"asin": "...", "brand": "...", "product": "...", "size": "...", "doi_fba": 13, "doi_total": 28, "inventory": 6018, "forecast": 1472, "sales_7_day": 450, "sales_30_day": 1890, "formula": ""}, ...],
+  "pagination": {"page": 1, "limit": 50, "total": 150, "total_pages": 3}
+}
+
+GET /product/B0C73TDZCQ
+Response: {"product": {...}, "inventory": {...}}
+
+GET /forecast/B0C73TDZCQ?doi_goal=120&lead_time=37
+Response: {"fba_available_days": 23, "total_days": 92, ...}
+
+GET /chart/B0C73TDZCQ?weeks=52&sales_velocity_weight=25&sv_velocity_weight=15
+Response: {"historical": [...], "forecast": [...], "metadata": {"sales_velocity_adj": 0.0856, "sv_velocity_adj": 0.0421, "total_adjustment": 0.1056, ...}}
+Note: Velocity weights are optional (defaults: 25% and 15%). Supports real-time adjustment.
+
+GET /sales-chart/B0C73TDZCQ?days=30
+Response: {
+  "asin": "B0C73TDZCQ",
+  "date_range": {"start": "2025-10-18", "end": "2025-11-16", "days": 30},
+  "chart_data": [{"date": "2025-10-18", "units_sold": 160.0, "sales": 1915.20}, ...],
+  "summary": {
+    "units_sold": {"current": 5372.0, "prior": 4298.0, "change_percent": 25.0},
+    "sales": {"current": 59782.26, "prior": 48275.11, "change_percent": 23.8},
+    "sessions": {"current": 9139.0, "prior": 8159.0, "change_percent": 12.0}
+  }
+}
+
+GET /ads-chart/B0C73TDZCQ?days=30
+Response: {
+  "asin": "B0C73TDZCQ",
+  "date_range": {"start": "2025-10-18", "end": "2025-11-16", "days": 30},
+  "chart_data": [{"date": "2025-10-18", "total_sales": 1915.20, "tacos": 12.5, "ad_spend": 125.30, "ad_units": 45.0}, ...],
+  "summary": {
+    "total_sales": {"current": 59782.26, "prior": 48275.11, "change_percent": 23.8},
+    "tacos": {"current": 12.5, "prior": 14.2, "change_percent": -12.0},
+    "ad_units": {"current": 1250.0, "prior": 1089.0, "change_percent": 14.8},
+    "ad_spend": {"current": 3545.25, "prior": 3102.50, "change_percent": 14.3},
+    "acos": {"current": 18.5, "prior": 20.1},
+    "cpc": {"current": 0.85, "prior": 0.92}
+  }
+}
+
+GET /forecast/B0C73TDZCQ
+Response: {"weekly_forecast_avg": 1471.7, "daily_forecast_avg": 210.2, ...}
+
+NOTE: `/forecast` and `/chart` expect `weekly_forecast_metrics` + `forecast_summaries`. Populate via:
+```
+python scripts/create_forecast_tables.py          # one-time
+python scripts/update_weekly_forecast_metrics.py  # refresh all ASINs
+```
+
+
+7. FRONTEND INTEGRATION
+------------------------
+const API_BASE = 'https://your-api-id.execute-api.region.amazonaws.com/prod';
+
+// Get product data
+fetch(`${API_BASE}/product/B0C73TDZCQ`)
+  .then(r => r.json())
+  .then(data => {
+    // data.product
+    // data.inventory.fba
+    // data.inventory.awd
+  });
+
+// Get forecast
+fetch(`${API_BASE}/forecast/B0C73TDZCQ`)
+  .then(r => r.json())
+  .then(data => {
+    // data.fba_available_days
+    // data.total_days
+    // data.forecast_days
+  });
+
+// Get chart data
+fetch(`${API_BASE}/chart/B0C73TDZCQ?weeks=52`)
+  .then(r => r.json())
+  .then(data => {
+    // data.historical[].units_sold
+    // data.forecast[].forecast_adjusted
+  });
+

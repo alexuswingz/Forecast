@@ -1,0 +1,16 @@
+# Forecasting module gitignore
+
+# Output files
+output/*.csv
+output/*.png
+output/*.xlsx
+
+# Settings (user-specific)
+settings.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+
