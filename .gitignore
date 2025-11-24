@@ -61,6 +61,10 @@ forecasting/output/
 ~$*.xlsx
 ~$*.xls
 
+# Fulfillment reports (sensitive data)
+Fulfillment reports/
+fulfillment_reports/
+
 # Lambda deployment
 lambda_forecast/forecast-lambda.zip
 
