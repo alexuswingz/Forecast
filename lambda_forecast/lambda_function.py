@@ -1,6 +1,39 @@
 """
 AWS Lambda Function for Forecast API
 Endpoints for inventory, forecasting, and chart data
+
+FORECASTING FORMULA - Based on "1000 Bananas AUTOFORECAST V1.2.xlsx"
+=====================================================================
+
+This implementation matches the Excel V1.2 forecasting formula exactly:
+
+1. Peak Envelope (Column C):
+   =MAX(OFFSET(B,-2,0,5))
+   5-week rolling maximum (current + 4 weeks before)
+
+2. Smooth Envelope (Column D):
+   =AVERAGE(OFFSET(C,-1,0,3))
+   3-week moving average of peak envelope
+
+3. Final Curve (Column E):
+   =MAX(B,C,D)
+   Maximum of raw data, peak envelope, and smooth envelope
+
+4. Final Smooth (Column F):
+   Weighted moving average with weights [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1]
+   11-week centered window (-5 to +5 weeks)
+   Sum of weights = 63
+   
+5. Forecast Smoothing:
+   Uses SAME weights as Final Smooth: [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1]
+   
+6. Velocity Adjustments (from Settings sheet):
+   - Sales Velocity Weight: 1.0 (100%)
+   - Search Volume Velocity Weight: 0.15 (15%)
+   
+7. Adjusted Forecast:
+   total_adjustment = (sales_velocity_adj * 1.0) + (sv_velocity_adj * 0.15)
+   forecast_adjusted = forecast_base * (1 + total_adjustment)
 """
 import json
 import os
@@ -43,13 +76,20 @@ def get_db_connection():
     )
 
 
-PEAK_WEIGHTS = [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1]
-FORECAST_WEIGHTS = [1, 3, 5, 7, 5, 3, 1]
-SALES_VELOCITY_WEIGHT = 0.25  # Default 25%
-SV_VELOCITY_WEIGHT = 0.15  # Default 15% (Search Volume Velocity)
+# Excel V1.2 formula uses the same weights for both historical and forecast smoothing
+# Weights: [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1] - 11-week centered weighted average
+SMOOTHING_WEIGHTS = [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1]
+# Excel V1.2 default settings
+SALES_VELOCITY_WEIGHT = 1.0  # Default 100% (from Excel Settings sheet)
+SV_VELOCITY_WEIGHT = 0.15  # Default 15% (Search Volume Velocity from Excel Settings sheet)
 
 
 def _peak_envelope(values):
+    """
+    Excel V1.2 Column C: units_peak_env
+    Formula: =MAX(OFFSET(B,-2,0,5))
+    5-week rolling maximum (looks at current row and 4 rows before)
+    """
     result = []
     n = len(values)
     for i in range(n):
@@ -61,6 +101,11 @@ def _peak_envelope(values):
 
 
 def _smooth_envelope(peak_values):
+    """
+    Excel V1.2 Column D: units_smooth_env
+    Formula: =AVERAGE(OFFSET(C,-1,0,3))
+    3-week moving average of the peak envelope (looks at previous, current, next)
+    """
     result = []
     n = len(peak_values)
     for i in range(n):
@@ -72,17 +117,27 @@ def _smooth_envelope(peak_values):
 
 
 def _final_curve(units, peak, smooth):
+    """
+    Excel V1.2 Column E: units_final_curve
+    Formula: =MAX(B,C,D)
+    Maximum of raw data, peak envelope, and smooth envelope
+    """
     return [max(u, p, s) for u, p, s in zip(units, peak, smooth)]
 
 
 def _final_smooth(final_curve):
+    """
+    Excel V1.2 Column F: units_final_smooth
+    Weighted moving average using weights [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1]
+    Looking at -5 to +5 weeks (11 weeks total, centered on current week)
+    """
     result = []
     n = len(final_curve)
-    radius = len(PEAK_WEIGHTS) // 2
+    radius = len(SMOOTHING_WEIGHTS) // 2  # radius = 5
     for i in range(n):
         weighted_sum = 0.0
         weight_total = 0.0
-        for offset, weight in zip(range(-radius, radius + 1), PEAK_WEIGHTS):
+        for offset, weight in zip(range(-radius, radius + 1), SMOOTHING_WEIGHTS):
             idx = i + offset
             if 0 <= idx < n:
                 weighted_sum += final_curve[idx] * weight
@@ -129,13 +184,18 @@ def _forecast_peak_from_baseline(baseline):
 
 
 def _forecast_final_smooth(peak_values):
+    """
+    Excel V1.2: Forecast smoothing uses SAME weights as historical smoothing
+    Weighted moving average using weights [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1]
+    Looking at -5 to +5 weeks (11 weeks total, centered on current week)
+    """
     result = []
     n = len(peak_values)
-    radius = len(FORECAST_WEIGHTS) // 2
+    radius = len(SMOOTHING_WEIGHTS) // 2  # radius = 5 (same as historical)
     for i in range(n):
         weighted_sum = 0.0
         weight_total = 0.0
-        for offset, weight in zip(range(-radius, radius + 1), FORECAST_WEIGHTS):
+        for offset, weight in zip(range(-radius, radius + 1), SMOOTHING_WEIGHTS):
             idx = i + offset
             if 0 <= idx < n:
                 weighted_sum += peak_values[idx] * weight
@@ -238,23 +298,29 @@ def get_product_inventory(asin):
         if not product:
             return {'error': 'Product not found'}
         
-        # Get latest inventory snapshot
+        # Get latest inventory snapshot per fulfillment program
         cur.execute("""
-            SELECT 
-                snapshot_date,
-                fulfillment_program,
-                SUM(available_quantity) as available,
-                SUM(reserved_quantity) as reserved,
-                SUM(inbound_working_quantity + inbound_shipped_quantity + inbound_receiving_quantity) as inbound,
-                SUM(total_quantity) as total
-            FROM inventory_snapshots
-            WHERE asin = %s
-            AND snapshot_date = (
-                SELECT MAX(snapshot_date) 
-                FROM inventory_snapshots 
+            WITH latest_per_program AS (
+                SELECT 
+                    fulfillment_program,
+                    MAX(snapshot_date) as max_date
+                FROM inventory_snapshots
                 WHERE asin = %s
+                GROUP BY fulfillment_program
             )
-            GROUP BY snapshot_date, fulfillment_program
+            SELECT 
+                i.snapshot_date,
+                i.fulfillment_program,
+                SUM(i.available_quantity) as available,
+                SUM(i.reserved_quantity) as reserved,
+                SUM(i.inbound_working_quantity + i.inbound_shipped_quantity + i.inbound_receiving_quantity) as inbound,
+                SUM(i.total_quantity) as total
+            FROM inventory_snapshots i
+            INNER JOIN latest_per_program lpp 
+                ON i.fulfillment_program = lpp.fulfillment_program 
+                AND i.snapshot_date = lpp.max_date
+            WHERE i.asin = %s
+            GROUP BY i.snapshot_date, i.fulfillment_program
         """, (asin, asin))
         
         inventory_rows = cur.fetchall()
@@ -978,33 +1044,35 @@ def get_planning_table(page=1, limit=20):
         # Calculate offset
         offset = (page - 1) * limit
         
-        # Get total count (ultra-fast approximation)
+        # Get total count from products table
         cur.execute("""
-            SELECT COUNT(DISTINCT asin) as total
-            FROM order_items
-            WHERE order_date::timestamp >= CURRENT_DATE - INTERVAL '30 days'
+            SELECT COUNT(DISTINCT p.asin) as total
+            FROM products p
+            WHERE EXISTS (
+                SELECT 1 FROM daily_product_metrics d
+                WHERE d.asin = p.asin
+                AND d.date >= CURRENT_DATE - INTERVAL '12 months'
+            )
         """)
         
         result = cur.fetchone()
         total_count = result['total'] if result else 0
         total_pages = (total_count + limit - 1) // limit  # Ceiling division
         
-        # Get paginated products with metrics (JOIN-optimized for speed)
+        # Get paginated products with metrics using daily_product_metrics
         cur.execute("""
             WITH recent_asins AS (
                 SELECT DISTINCT asin
-                FROM order_items
-                WHERE order_date::timestamp >= CURRENT_DATE - INTERVAL '30 days'
+                FROM daily_product_metrics
+                WHERE date >= CURRENT_DATE - INTERVAL '12 months'
                 ORDER BY asin
-                LIMIT 1000
             ),
             sales_metrics AS (
                 SELECT 
                     asin,
-                    SUM(CASE WHEN order_date::timestamp >= CURRENT_DATE - INTERVAL '7 days' THEN quantity ELSE 0 END) as sales_7,
-                    SUM(CASE WHEN order_date::timestamp >= CURRENT_DATE - INTERVAL '30 days' THEN quantity ELSE 0 END) as sales_30,
-                    COUNT(CASE WHEN order_date::timestamp >= CURRENT_DATE - INTERVAL '12 weeks' THEN 1 END) as order_count_12w
-                FROM order_items
+                    SUM(CASE WHEN date >= CURRENT_DATE - INTERVAL '7 days' THEN units_sold ELSE 0 END) as sales_7,
+                    SUM(CASE WHEN date >= CURRENT_DATE - INTERVAL '30 days' THEN units_sold ELSE 0 END) as sales_30
+                FROM daily_product_metrics
                 WHERE asin IN (SELECT asin FROM recent_asins)
                 GROUP BY asin
             ),
@@ -1016,19 +1084,20 @@ def get_planning_table(page=1, limit=20):
                 WHERE asin IN (SELECT asin FROM recent_asins)
                 ORDER BY asin, snapshot_date DESC
             ),
-            forecast_metrics AS (
+            recent_weekly_sales AS (
                 SELECT 
                     asin,
-                    forecast_adjusted,
-                    ROW_NUMBER() OVER (PARTITION BY asin ORDER BY week_end) as rn
-                FROM weekly_forecast_metrics
-                WHERE asin IN (SELECT asin FROM recent_asins)
-                  AND is_forecast = TRUE
-            ),
-            forecast_avg AS (
-                SELECT asin, AVG(forecast_adjusted) as weekly_forecast
-                FROM forecast_metrics
-                WHERE rn <= 12
+                    AVG(weekly_units) as avg_weekly_sales
+                FROM (
+                    SELECT 
+                        asin,
+                        DATE_TRUNC('week', date)::date as week_start,
+                        SUM(units_sold) as weekly_units
+                    FROM daily_product_metrics
+                    WHERE asin IN (SELECT asin FROM recent_asins)
+                    AND date >= CURRENT_DATE - INTERVAL '12 weeks'
+                    GROUP BY asin, DATE_TRUNC('week', date)
+                ) weekly
                 GROUP BY asin
             )
             SELECT 
@@ -1038,13 +1107,13 @@ def get_planning_table(page=1, limit=20):
                 p.size,
                 COALESCE(sm.sales_7, 0) as sales_7_day,
                 COALESCE(sm.sales_30, 0) as sales_30_day,
-                COALESCE(fa.weekly_forecast, 0) as weekly_forecast,
+                COALESCE(rws.avg_weekly_sales, 0) as weekly_forecast,
                 COALESCE(li.total_quantity, 0) as inventory
             FROM products p
             INNER JOIN recent_asins ra ON ra.asin = p.asin
             LEFT JOIN sales_metrics sm ON sm.asin = p.asin
             LEFT JOIN latest_inventory li ON li.asin = p.asin
-            LEFT JOIN forecast_avg fa ON fa.asin = p.asin
+            LEFT JOIN recent_weekly_sales rws ON rws.asin = p.asin
             ORDER BY p.brand, p.product_name, p.size
             LIMIT %s OFFSET %s
         """, (limit, offset))
