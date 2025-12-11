@@ -19,7 +19,7 @@ This implementation matches the Excel V1.2 forecasting formula exactly:
    =MAX(B,C,D)
    Maximum of raw data, peak envelope, and smooth envelope
 
-4. Final Smooth (Column F):
+4. Final Smooth (Column F) - "units_smooth":
    Weighted moving average with weights [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1]
    11-week centered window (-5 to +5 weeks)
    Sum of weights = 63
@@ -31,9 +31,19 @@ This implementation matches the Excel V1.2 forecasting formula exactly:
    - Sales Velocity Weight: 1.0 (100%)
    - Search Volume Velocity Weight: 0.15 (15%)
    
-7. Adjusted Forecast:
+7. Adjusted Forecast - "adj_forecast":
    total_adjustment = (sales_velocity_adj * 1.0) + (sv_velocity_adj * 0.15)
-   forecast_adjusted = forecast_base * (1 + total_adjustment)
+   adj_forecast = units_smooth * (1 + total_adjustment)
+
+API Response Field Names:
+========================
+  Historical data:
+    - units_sold: Actual units sold (raw data from Column B)
+    - units_smooth: Smoothed historical data (Column F - forecast_final_smooth)
+  
+  Forecast data:
+    - units_smooth: Base forecast (smoothed seasonal baseline)
+    - adj_forecast: Velocity-adjusted forecast (with sales + SV adjustments)
 """
 import json
 import os
@@ -483,8 +493,8 @@ def get_forecast_chart_data(asin, weeks_ahead=52, sales_velocity_weight=None, sv
             week_date = last_week + timedelta(days=7 * (idx + 1))
             forecast_entries.append({
                 'week_end': week_date.isoformat(),
-                'forecast_base': round(base_value, 1),
-                'forecast_adjusted': round(forecast_adjusted[idx], 1)
+                'units_smooth': round(base_value, 1),  # Base forecast (smoothed baseline)
+                'adj_forecast': round(forecast_adjusted[idx], 1)  # Velocity-adjusted forecast
             })
         
         historical_entries = []
@@ -730,8 +740,8 @@ def _get_forecast_chart_data_precomputed(asin, weeks_ahead=52):
                 
                 forecast.append({
                     'week_end': str(week_date),
-                    'forecast_base': round(base_forecast, 1),
-                    'forecast_adjusted': round(adjusted_forecast, 1)
+                    'units_smooth': round(base_forecast, 1),  # Base forecast (smoothed baseline)
+                    'adj_forecast': round(adjusted_forecast, 1)  # Velocity-adjusted forecast
                 })
             
             return {
@@ -770,8 +780,8 @@ def _get_forecast_chart_data_precomputed(asin, weeks_ahead=52):
                 if row['is_forecast']:
                     forecast.append({
                         'week_end': week_str,
-                        'forecast_base': float(row['forecast_base'] or 0),
-                        'forecast_adjusted': float(row['forecast_adjusted'] or 0)
+                        'units_smooth': float(row['forecast_base'] or 0),  # Base forecast (smoothed baseline)
+                        'adj_forecast': float(row['forecast_adjusted'] or 0)  # Velocity-adjusted forecast
                     })
                 else:
                     historical.append({
@@ -802,7 +812,7 @@ def _get_forecast_chart_data_precomputed(asin, weeks_ahead=52):
             
             avg_window = min(len(forecast), 12)
             if avg_window > 0:
-                metadata['avg_weekly_sales'] = round(sum(item['forecast_adjusted'] for item in forecast[:avg_window]) / avg_window, 1)
+                metadata['avg_weekly_sales'] = round(sum(item['adj_forecast'] for item in forecast[:avg_window]) / avg_window, 1)
             else:
                 metadata['avg_weekly_sales'] = 0.0
             
