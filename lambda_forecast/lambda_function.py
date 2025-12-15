@@ -2,48 +2,72 @@
 AWS Lambda Function for Forecast API
 Endpoints for inventory, forecasting, and chart data
 
-FORECASTING FORMULA - Based on "1000 Bananas AUTOFORECAST V1.2.xlsx"
+FORECASTING FORMULA - Based on "TPS AutoForecast 2025.12.5.xlsx"
 =====================================================================
 
-This implementation matches the Excel V1.2 forecasting formula exactly:
+This implementation matches the Excel forecasting formula exactly:
 
-1. Peak Envelope (Column C):
+HISTORICAL DATA PROCESSING:
+---------------------------
+1. Peak Envelope (Column C - units_peak_env):
    =MAX(OFFSET(B,-2,0,5))
-   5-week rolling maximum (current + 4 weeks before)
+   5-week rolling maximum centered on current row
 
-2. Smooth Envelope (Column D):
+2. Smooth Envelope (Column D - units_smooth_env):
    =AVERAGE(OFFSET(C,-1,0,3))
    3-week moving average of peak envelope
 
-3. Final Curve (Column E):
+3. Final Curve (Column E - units_final_curve):
    =MAX(B,C,D)
-   Maximum of raw data, peak envelope, and smooth envelope
+   Maximum of raw units, peak envelope, and smooth envelope
 
-4. Final Smooth (Column F) - "units_smooth":
+4. Final Smooth (Column F - units_final_smooth):
    Weighted moving average with weights [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1]
-   11-week centered window (-5 to +5 weeks)
-   Sum of weights = 63
+   11-week centered window (-5 to +5 weeks), sum of weights = 63
+
+FORECAST GENERATION:
+--------------------
+5. Forecast Baseline (Column G - forecast):
+   =F[row-52]  (52-week lag)
+   Uses last year's smoothed data as seasonal baseline
+
+6. Forecast Peak Envelope (Column H - forecast_units_peak_env):
+   =MAX(OFFSET(G,-2,0,2))
+   2-week rolling maximum looking backward
+
+7. Forecast Final Smooth (Column I - forecast_final_smooth):
+   Weighted moving average with weights [1, 3, 5, 7, 5, 3, 1]
+   7-week centered window (-3 to +3 weeks), sum of weights = 25
+   NOTE: Different weights than historical smoothing!
+
+VELOCITY ADJUSTMENTS:
+---------------------
+8. Sales Velocity Adjustment (Column J):
+   weighted_avg = 0.25 * (1wk/7 + 2wk/14 + 4wk/28 + 6wk/42)
+   sales_velocity_adj = (actual_weighted_avg / baseline_weighted_avg) - 1
    
-5. Forecast Smoothing:
-   Uses SAME weights as Final Smooth: [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1]
-   
-6. Velocity Adjustments (from Settings sheet):
-   - Sales Velocity Weight: 1.0 (100%)
-   - Search Volume Velocity Weight: 0.15 (15%)
-   
-7. Adjusted Forecast - "adj_forecast":
-   total_adjustment = (sales_velocity_adj * 1.0) + (sv_velocity_adj * 0.15)
-   adj_forecast = units_smooth * (1 + total_adjustment)
+9. Settings (from Settings sheet):
+   - Sales Velocity Weight: 0.25 (25%)
+   - Search Volume Velocity Weight: 0.0 (disabled)
+
+10. Adjusted Forecast (Column L - adj_forecast):
+    adj_forecast = forecast_final_smooth * (1 + sales_velocity_adj * weight)
+
+UNITS TO MAKE CALCULATION:
+--------------------------
+11. From Inventory sheet:
+    units_to_make = SUM(forecast from today to end_date) - current_inventory
+    where end_date = today + DOI_GOAL + LEAD_TIME
 
 API Response Field Names:
 ========================
   Historical data:
     - units_sold: Actual units sold (raw data from Column B)
-    - units_smooth: Smoothed historical data (Column F - forecast_final_smooth)
+    - units_smooth: Smoothed historical data (Column F - units_final_smooth)
   
   Forecast data:
-    - units_smooth: Base forecast (smoothed seasonal baseline)
-    - adj_forecast: Velocity-adjusted forecast (with sales + SV adjustments)
+    - units_smooth: Base forecast (Column I - forecast_final_smooth)
+    - adj_forecast: Velocity-adjusted forecast (Column L)
 """
 import json
 import os
@@ -86,12 +110,21 @@ def get_db_connection():
     )
 
 
-# Excel V1.2 formula uses the same weights for both historical and forecast smoothing
-# Weights: [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1] - 11-week centered weighted average
+# Excel V1.2 formula - HISTORICAL smoothing uses 11-week centered weighted average
+# Weights: [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1] - sum = 63
 SMOOTHING_WEIGHTS = [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1]
-# Excel V1.2 default settings
-SALES_VELOCITY_WEIGHT = 1.0  # Default 100% (from Excel Settings sheet)
-SV_VELOCITY_WEIGHT = 0.15  # Default 15% (Search Volume Velocity from Excel Settings sheet)
+
+# Excel V1.2 formula - FORECAST smoothing uses 7-week centered weighted average  
+# Weights: [1, 3, 5, 7, 5, 3, 1] - sum = 25
+FORECAST_SMOOTHING_WEIGHTS = [1, 3, 5, 7, 5, 3, 1]
+
+# Excel V1.2 default settings (from Settings sheet)
+SALES_VELOCITY_WEIGHT = 0.25  # Default 25% (from Excel Settings!B8)
+SV_VELOCITY_WEIGHT = 0.0  # Default 0% - disabled (from Excel Settings!B10)
+
+# New Product Algorithm constants
+NEW_PRODUCT_AGE_MONTHS = 12  # Products younger than this use new product algorithm
+NEW_PRODUCT_MULTIPLIER = 20  # Best selling week × this value
 
 
 def _peak_envelope(values):
@@ -156,7 +189,43 @@ def _final_smooth(final_curve):
     return result
 
 
+def _build_forecast_from_lag(final_smooth, weeks_ahead, lag=52):
+    """
+    Excel V1.2: Forecast is built from 52-week lagged historical smoothed data.
+    Formula: forecast[i] = final_smooth[i - 52]
+    
+    This directly uses last year's smoothed data as the seasonal baseline,
+    preserving the actual magnitude and pattern from the prior year.
+    """
+    hist_len = len(final_smooth)
+    forecast = []
+    
+    for i in range(weeks_ahead):
+        # Current position in combined timeline
+        combined_idx = hist_len + i
+        # Look back 52 weeks to get baseline
+        lag_idx = combined_idx - lag
+        
+        if 0 <= lag_idx < hist_len:
+            # Use actual smoothed value from 52 weeks ago
+            forecast.append(final_smooth[lag_idx])
+        elif lag_idx >= hist_len:
+            # We're beyond the historical data, cycle back
+            # This handles forecasts longer than 52 weeks
+            cycle_idx = lag_idx % hist_len if hist_len > 0 else 0
+            forecast.append(final_smooth[cycle_idx] if hist_len > 0 else 0.0)
+        else:
+            # Before start of historical data, use earliest available
+            forecast.append(final_smooth[0] if hist_len > 0 else 0.0)
+    
+    return forecast
+
+
 def _seasonal_placeholder(units, weeks_ahead):
+    """
+    DEPRECATED: Legacy fallback for when we don't have enough data.
+    Use _build_forecast_from_lag() for proper 52-week lag forecast.
+    """
     if not units:
         return [0.0] * weeks_ahead
     
@@ -179,6 +248,7 @@ def _seasonal_placeholder(units, weeks_ahead):
 
 
 def _build_seasonal_baseline(final_smooth, lag=52):
+    """Legacy function for backwards compatibility"""
     baseline = [None] * len(final_smooth)
     for i in range(lag, len(final_smooth)):
         baseline[i] = final_smooth[i - lag]
@@ -186,6 +256,7 @@ def _build_seasonal_baseline(final_smooth, lag=52):
 
 
 def _forecast_peak_from_baseline(baseline):
+    """Legacy function for backwards compatibility"""
     peak = []
     for i in range(len(baseline)):
         values = [baseline[j] for j in range(max(0, i - 2), i + 1) if baseline[j] is not None]
@@ -193,19 +264,91 @@ def _forecast_peak_from_baseline(baseline):
     return peak
 
 
+def _forecast_peak_from_baseline_list(forecast_baseline):
+    """
+    Excel V1.2 Column H: forecast_units_peak_env
+    Formula: =MAX(OFFSET($G,-2,0,2))
+    2-week rolling maximum looking at current and previous week
+    """
+    peak = []
+    n = len(forecast_baseline)
+    for i in range(n):
+        # Look at current and previous week (2-week window)
+        start = max(0, i - 1)
+        end = i + 1
+        window = forecast_baseline[start:end]
+        peak.append(max(window) if window else 0.0)
+    return peak
+
+
+def _calculate_sales_velocity_excel(hist_units, hist_len):
+    """
+    Excel V1.2 Column J: sales_velocity_adj_weighted
+    Compares recent RAW sales (last 6 weeks) to same period from 52 weeks ago.
+    
+    Uses RAW units (not smoothed) to avoid distortion from the smoothing window
+    which can include data from very different seasons.
+    
+    weighted_avg = 0.25 * (1wk/7 + 2wk/14 + 4wk/28 + 6wk/42)
+    velocity_adj = (recent_avg / year_ago_baseline_avg) - 1
+    
+    This measures: "How is current sales performance vs same time last year?"
+    Positive = selling more than last year → adjust forecast up
+    Negative = selling less than last year → adjust forecast down
+    """
+    if hist_len < 58:  # Need at least 52 + 6 weeks of history
+        return 0.0
+    
+    def weighted_daily_avg(values):
+        """Calculate Excel's weighted daily average from weekly values"""
+        if len(values) < 6:
+            return None
+        v = list(values[-6:])
+        
+        # 1-week daily avg (most recent week)
+        avg_1wk = v[-1] / 7.0
+        # 2-week daily avg  
+        avg_2wk = sum(v[-2:]) / 14.0
+        # 4-week daily avg
+        avg_4wk = sum(v[-4:]) / 28.0
+        # 6-week daily avg
+        avg_6wk = sum(v[-6:]) / 42.0
+        
+        return 0.25 * (avg_1wk + avg_2wk + avg_4wk + avg_6wk)
+    
+    # Recent actual: last 6 weeks of RAW historical data
+    recent_actual = hist_units[-6:]
+    actual_avg = weighted_daily_avg(recent_actual)
+    
+    # Baseline: same 6-week period from 52 weeks ago
+    # If hist_len = 100, recent is [94:100], baseline should be [42:48] (52 weeks earlier)
+    baseline_end = hist_len - 52
+    baseline_start = baseline_end - 6
+    if baseline_start < 0:
+        return 0.0
+    
+    baseline = hist_units[baseline_start:baseline_end]
+    baseline_avg = weighted_daily_avg(baseline)
+    
+    if actual_avg is None or baseline_avg is None or baseline_avg == 0:
+        return 0.0
+    
+    return (actual_avg / baseline_avg) - 1
+
+
 def _forecast_final_smooth(peak_values):
     """
-    Excel V1.2: Forecast smoothing uses SAME weights as historical smoothing
-    Weighted moving average using weights [1, 2, 4, 7, 11, 13, 11, 7, 4, 2, 1]
-    Looking at -5 to +5 weeks (11 weeks total, centered on current week)
+    Excel V1.2: Forecast smoothing uses DIFFERENT weights than historical
+    Weighted moving average using weights [1, 3, 5, 7, 5, 3, 1] - 7-week window
+    Looking at -3 to +3 weeks (7 weeks total, centered on current week)
     """
     result = []
     n = len(peak_values)
-    radius = len(SMOOTHING_WEIGHTS) // 2  # radius = 5 (same as historical)
+    radius = len(FORECAST_SMOOTHING_WEIGHTS) // 2  # radius = 3 (7-week window)
     for i in range(n):
         weighted_sum = 0.0
         weight_total = 0.0
-        for offset, weight in zip(range(-radius, radius + 1), SMOOTHING_WEIGHTS):
+        for offset, weight in zip(range(-radius, radius + 1), FORECAST_SMOOTHING_WEIGHTS):
             idx = i + offset
             if 0 <= idx < n:
                 weighted_sum += peak_values[idx] * weight
@@ -240,6 +383,174 @@ def _sales_velocity_ratio(actual_final_smooth, baseline_final_smooth):
     if actual_avg is None or baseline_avg in (None, 0):
         return 0.0
     return (actual_avg / baseline_avg) - 1
+
+
+# =============================================================================
+# NEW PRODUCT ALGORITHM FUNCTIONS
+# Products with age 0-12 months: Best Selling Week × 20 - Vine Units Claimed
+# Products with age 12+ months: Established product algorithm (seasonal forecast)
+# =============================================================================
+
+def get_product_age_months(asin, conn=None):
+    """
+    Get product age in months based on first sale date.
+    
+    Returns:
+        int: Age in months (0 if no sales history)
+    """
+    should_close = conn is None
+    if conn is None:
+        conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            SELECT 
+                MIN(date) as first_sale_date,
+                (CURRENT_DATE - MIN(date)::date) as age_days
+            FROM daily_product_metrics
+            WHERE asin = %s
+            AND units_sold > 0
+        """, (asin,))
+        
+        row = cur.fetchone()
+        if row and row['age_days'] is not None:
+            return int(row['age_days']) // 30
+        return 0
+    finally:
+        cur.close()
+        if should_close:
+            conn.close()
+
+
+def get_best_selling_week(asin, conn=None):
+    """
+    Get the best (highest) selling week for a product.
+    
+    Returns:
+        int: Units sold in the best week (0 if no sales)
+    """
+    should_close = conn is None
+    if conn is None:
+        conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            WITH weekly_sales AS (
+                SELECT 
+                    DATE_TRUNC('week', date)::date as week_start,
+                    SUM(units_sold) as weekly_units
+                FROM daily_product_metrics
+                WHERE asin = %s
+                GROUP BY DATE_TRUNC('week', date)
+            )
+            SELECT MAX(weekly_units) as best_week
+            FROM weekly_sales
+        """, (asin,))
+        
+        row = cur.fetchone()
+        if row and row['best_week'] is not None:
+            return int(row['best_week'])
+        return 0
+    finally:
+        cur.close()
+        if should_close:
+            conn.close()
+
+
+def get_vine_units_claimed(asin, conn=None):
+    """
+    Get total Vine units claimed for a product.
+    
+    Note: Currently reads from vine_units_claimed table.
+    If table doesn't exist, returns 0.
+    
+    Returns:
+        int: Total units claimed via Vine program (0 if none)
+    """
+    should_close = conn is None
+    if conn is None:
+        conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Check if vine_units_claimed table exists
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name = 'vine_units_claimed'
+            )
+        """)
+        table_exists = cur.fetchone()['exists']
+        
+        if not table_exists:
+            return 0
+        
+        cur.execute("""
+            SELECT COALESCE(SUM(units_claimed), 0) as total_claimed
+            FROM vine_units_claimed
+            WHERE asin = %s
+        """, (asin,))
+        
+        row = cur.fetchone()
+        if row and row['total_claimed'] is not None:
+            return int(row['total_claimed'])
+        return 0
+    finally:
+        cur.close()
+        if should_close:
+            conn.close()
+
+
+def calculate_new_product_forecast(asin, settings=None):
+    """
+    Calculate forecast for NEW products (age 0-12 months).
+    
+    Formula: Best Selling Week × 20 - Vine Units Claimed
+    
+    Returns:
+        dict: {
+            "algorithm": "new_product",
+            "product_age_months": 5,
+            "best_selling_week": 854,
+            "vine_units_claimed": 30,
+            "units_to_make": 17050,
+            "formula": "854 × 20 - 30 = 17050"
+        }
+    """
+    conn = get_db_connection()
+    
+    try:
+        age_months = get_product_age_months(asin, conn)
+        best_week = get_best_selling_week(asin, conn)
+        vine_units = get_vine_units_claimed(asin, conn)
+        
+        units_to_make = max(0, (best_week * NEW_PRODUCT_MULTIPLIER) - vine_units)
+        
+        return {
+            "algorithm": "new_product",
+            "product_age_months": age_months,
+            "best_selling_week": best_week,
+            "vine_units_claimed": vine_units,
+            "multiplier": NEW_PRODUCT_MULTIPLIER,
+            "units_to_make": units_to_make,
+            "formula": f"{best_week} × {NEW_PRODUCT_MULTIPLIER} - {vine_units} = {units_to_make}"
+        }
+    finally:
+        conn.close()
+
+
+def is_new_product(asin, conn=None):
+    """
+    Check if product should use new product algorithm.
+    
+    Returns:
+        bool: True if product age < 12 months
+    """
+    age_months = get_product_age_months(asin, conn)
+    return age_months < NEW_PRODUCT_AGE_MONTHS
 
 
 def cors_response(status_code, body):
@@ -447,21 +758,27 @@ def get_forecast_chart_data(asin, weeks_ahead=52, sales_velocity_weight=None, sv
             sv_data[week_end_str] = float(sessions)
         
         horizon = max(1, min(int(weeks_ahead), 104))
-        placeholder = _seasonal_placeholder(hist_units, horizon)
         
-        combined_units = hist_units + placeholder
-        peak_env = _peak_envelope(combined_units)
+        # Step 1: Calculate historical smoothing (peak envelope -> smooth envelope -> final curve -> final smooth)
+        peak_env = _peak_envelope(hist_units)
         smooth_env = _smooth_envelope(peak_env)
-        final_curve = _final_curve(combined_units, peak_env, smooth_env)
-        final_smooth = _final_smooth(final_curve)
+        final_curve = _final_curve(hist_units, peak_env, smooth_env)
+        hist_smooth = _final_smooth(final_curve)
         
-        hist_smooth = final_smooth[:hist_len]
-        baseline = _build_seasonal_baseline(final_smooth)
-        baseline_peak = _forecast_peak_from_baseline(baseline)
-        baseline_final = _forecast_final_smooth(baseline_peak)
+        # Step 2: Build forecast baseline from 52-week lag of historical smoothed data
+        # Excel formula: G55 = F3 (forecast = units_final_smooth from 52 weeks ago)
+        forecast_baseline = _build_forecast_from_lag(hist_smooth, horizon, lag=52)
         
-        # Calculate sales velocity adjustment
-        sales_velocity_adj = _sales_velocity_ratio(final_smooth[:hist_len], baseline_final[:hist_len])
+        # Step 3: Apply peak envelope to forecast baseline
+        forecast_peak = _forecast_peak_from_baseline_list(forecast_baseline)
+        
+        # Step 4: Apply forecast smoothing (7-week weights) to get forecast_final_smooth
+        forecast_smooth = _forecast_final_smooth(forecast_peak)
+        
+        # Step 5: Calculate sales velocity adjustment using Excel's weighted daily average formula
+        # Compares recent 6 weeks RAW units vs same period from 52 weeks ago
+        # velocity_adj = (recent_avg / year_ago_avg) - 1
+        sales_velocity_adj = _calculate_sales_velocity_excel(hist_units, hist_len)
         
         # Calculate search volume velocity adjustment
         sv_velocity_adj = 0.0
@@ -481,19 +798,20 @@ def get_forecast_chart_data(asin, weeks_ahead=52, sales_velocity_weight=None, sv
                     sv_velocity_adj = (recent_avg - baseline_avg) / baseline_avg
         
         # Combine both velocity adjustments with their respective weights
+        # Excel Settings: Sales Velocity Weight = 0.25 (25%), SV Weight = 0.0 (disabled)
         total_adjustment = (sales_velocity_adj * sales_velocity_weight) + (sv_velocity_adj * sv_velocity_weight)
         total_multiplier = max(0.0, 1.0 + total_adjustment)
         
-        forecast_base = final_smooth[hist_len:hist_len + horizon]
-        forecast_adjusted = [max(0.0, fb * total_multiplier) for fb in forecast_base]
+        # Apply velocity adjustment to forecast_final_smooth
+        forecast_adjusted = [max(0.0, fs * total_multiplier) for fs in forecast_smooth]
         
         last_week = hist_dates[-1]
         forecast_entries = []
-        for idx, base_value in enumerate(forecast_base):
+        for idx, smooth_value in enumerate(forecast_smooth):
             week_date = last_week + timedelta(days=7 * (idx + 1))
             forecast_entries.append({
                 'week_end': week_date.isoformat(),
-                'units_smooth': round(base_value, 1),  # Base forecast (smoothed baseline)
+                'units_smooth': round(smooth_value, 1),  # Base forecast (forecast_final_smooth)
                 'adj_forecast': round(forecast_adjusted[idx], 1)  # Velocity-adjusted forecast
             })
         
@@ -537,6 +855,12 @@ def calculate_forecast_days(asin, settings=None):
     """
     Calculate DOI and forecast days
     
+    NEW PRODUCT ALGORITHM (age 0-12 months):
+        units_to_make = Best Selling Week × 20 - Vine Units Claimed
+        
+    ESTABLISHED PRODUCT ALGORITHM (age 12+ months):
+        units_to_make = Cumulative Forecast to DOI Goal - Current Inventory
+    
     Returns:
         {
             "current_date": "2025-11-17",
@@ -548,13 +872,19 @@ def calculate_forecast_days(asin, settings=None):
             "inventory": {
                 "total": 2392331,
                 "available_fba": 2392267
-            }
+            },
+            "algorithm": "established_product" | "new_product",
+            "new_product_details": {...}  # Only for new products
         }
     """
     conn = get_db_connection()
     cur = conn.cursor()
     
     try:
+        # Check product age to determine algorithm
+        product_age_months = get_product_age_months(asin, conn)
+        use_new_product_algo = product_age_months < NEW_PRODUCT_AGE_MONTHS
+        
         # Get settings
         doi_goal = (settings or {}).get('doi_goal', 120)
         lead_time = (settings or {}).get('lead_time', 37)
@@ -627,22 +957,180 @@ def calculate_forecast_days(asin, settings=None):
         # Calculate forecast period (remaining to hit DOI goal)
         forecast_days = max(0, doi_goal - total_days)
         
-        # Calculate target dates
-        current_date = datetime.now().date()
+        # Calculate target dates (use UTC to match frontend date parsing)
+        from datetime import timezone
+        current_date = datetime.now(timezone.utc).date()
         doi_goal_date = current_date + timedelta(days=doi_goal)
-        runout_date = current_date + timedelta(days=total_days)
+        fba_runout_date = current_date + timedelta(days=fba_available_days)  # When FBA depletes
+        total_runout_date = current_date + timedelta(days=total_days)  # When all inventory depletes
         
-        # Calculate units to make (to reach DOI goal)
-        if avg_daily_sales > 0:
-            target_inventory = avg_daily_sales * doi_goal
-            units_to_make = max(0, int(target_inventory - total_inv))
+        # Calculate units to make using cumulative forecast (Excel V1.2 method)
+        # Formula: SUM(forecast from today to end_date) - current_inventory
+        # where end_date = today + doi_goal + lead_time
+        target_days = doi_goal + lead_time
+        
+        # Get cumulative forecast for the target period
+        cur.execute("""
+            WITH forecast_data AS (
+                SELECT 
+                    week_end,
+                    COALESCE(forecast_adjusted, forecast_base, 0) as weekly_forecast
+                FROM weekly_forecast_metrics
+                WHERE asin = %s
+                  AND is_forecast = TRUE
+                  AND week_end >= CURRENT_DATE
+                ORDER BY week_end
+            )
+            SELECT 
+                SUM(weekly_forecast) as cumulative_forecast,
+                COUNT(*) as weeks_counted
+            FROM forecast_data
+            WHERE week_end <= CURRENT_DATE + INTERVAL '%s days'
+        """, (asin, target_days))
+        
+        forecast_row = cur.fetchone()
+        cumulative_forecast = float(forecast_row['cumulative_forecast'] or 0) if forecast_row else 0.0
+        
+        # If no precomputed forecast, calculate on-the-fly using the chart data method
+        if cumulative_forecast <= 0:
+            # Get chart data with forecast
+            chart_data = get_forecast_chart_data(asin, weeks_ahead=int(target_days / 7) + 2)
+            if 'forecast' in chart_data and chart_data['forecast']:
+                # Sum weekly forecasts up to target_days
+                weeks_needed = int(target_days / 7) + 1
+                forecast_values = [f['adj_forecast'] for f in chart_data['forecast'][:weeks_needed]]
+                
+                # Pro-rate the last partial week if needed
+                full_weeks = target_days // 7
+                extra_days = target_days % 7
+                
+                if len(forecast_values) > 0:
+                    cumulative_forecast = sum(forecast_values[:full_weeks])
+                    if extra_days > 0 and len(forecast_values) > full_weeks:
+                        # Add partial week contribution
+                        cumulative_forecast += (forecast_values[full_weeks] * extra_days / 7)
+        
+        # Calculate units_to_make based on product algorithm
+        new_product_details = None
+        
+        if use_new_product_algo:
+            # NEW PRODUCT ALGORITHM: Best Selling Week × 20 - Vine Units
+            best_week = get_best_selling_week(asin, conn)
+            vine_units = get_vine_units_claimed(asin, conn)
+            units_to_make = max(0, (best_week * NEW_PRODUCT_MULTIPLIER) - vine_units)
+            
+            new_product_details = {
+                "product_age_months": product_age_months,
+                "best_selling_week": best_week,
+                "vine_units_claimed": vine_units,
+                "multiplier": NEW_PRODUCT_MULTIPLIER,
+                "formula": f"{best_week} × {NEW_PRODUCT_MULTIPLIER} - {vine_units} = {units_to_make}"
+            }
         else:
-            units_to_make = 0
+            # ESTABLISHED PRODUCT ALGORITHM: Cumulative Forecast - Current Inventory
+            units_to_make = max(0, int(cumulative_forecast - total_inv))
         
-        return {
+        # ============================================
+        # CHART RENDERING - Pre-calculated for frontend
+        # ============================================
+        # Define chart date range (26 weeks historical + forecast to DOI goal)
+        chart_start_date = current_date - timedelta(weeks=26)
+        chart_end_date = doi_goal_date
+        total_chart_days = (chart_end_date - chart_start_date).days
+        
+        def date_to_pct(d):
+            """Convert date to percentage position on chart (0-100)"""
+            if total_chart_days <= 0:
+                return 0
+            days_from_start = (d - chart_start_date).days
+            return round(max(0, min(100, (days_from_start / total_chart_days) * 100)), 2)
+        
+        def date_to_timestamp(d):
+            """Convert date to JavaScript timestamp (milliseconds) - UTC midnight
+            Must match how frontend parses dates: new Date('2025-12-11') = UTC midnight
+            """
+            import calendar
+            from datetime import datetime as dt
+            # Use UTC midnight to match JavaScript's Date parsing of ISO date strings
+            return int(calendar.timegm(dt.combine(d, dt.min.time()).timetuple()) * 1000)
+        
+        # Calculate period percentages
+        today_pct = date_to_pct(current_date)
+        fba_runout_pct = date_to_pct(fba_runout_date)
+        total_runout_pct = date_to_pct(total_runout_date)
+        doi_goal_pct = date_to_pct(doi_goal_date)
+        
+        chart_rendering = {
+            'data_range': {
+                'start_date': str(chart_start_date),
+                'end_date': str(chart_end_date),
+                'start_timestamp': date_to_timestamp(chart_start_date),
+                'end_timestamp': date_to_timestamp(chart_end_date),
+                'total_days': total_chart_days
+            },
+            'periods': [
+                {
+                    'id': 'fba_available',
+                    'label': 'FBA Available',
+                    'start_date': str(current_date),
+                    'end_date': str(fba_runout_date),
+                    'start_timestamp': date_to_timestamp(current_date),
+                    'end_timestamp': date_to_timestamp(fba_runout_date),
+                    'start_pct': today_pct,
+                    'end_pct': fba_runout_pct,
+                    'width_pct': round(fba_runout_pct - today_pct, 2),
+                    'color': '#a855f7',
+                    'opacity': 0.35,
+                    'days': fba_available_days
+                },
+                {
+                    'id': 'total_inventory',
+                    'label': 'Total Inventory',
+                    'start_date': str(fba_runout_date),
+                    'end_date': str(total_runout_date),
+                    'start_timestamp': date_to_timestamp(fba_runout_date),
+                    'end_timestamp': date_to_timestamp(total_runout_date),
+                    'start_pct': fba_runout_pct,
+                    'end_pct': total_runout_pct,
+                    'width_pct': round(total_runout_pct - fba_runout_pct, 2),
+                    'color': '#22c55e',
+                    'opacity': 0.5,
+                    'days': max(0, total_days - fba_available_days)
+                },
+                {
+                    'id': 'forecast_period',
+                    'label': 'Forecast Period',
+                    'start_date': str(total_runout_date),
+                    'end_date': str(doi_goal_date),
+                    'start_timestamp': date_to_timestamp(total_runout_date),
+                    'end_timestamp': date_to_timestamp(doi_goal_date),
+                    'start_pct': total_runout_pct,
+                    'end_pct': doi_goal_pct,
+                    'width_pct': round(doi_goal_pct - total_runout_pct, 2),
+                    'color': '#3b82f6',
+                    'opacity': 0.35,
+                    'days': forecast_days
+                }
+            ],
+            'today_marker': {
+                'date': str(current_date),
+                'timestamp': date_to_timestamp(current_date),
+                'position_pct': today_pct,
+                'label': 'Today',
+                'formatted_date': current_date.strftime('%m/%d/%y')
+            },
+            'chart_margins': {
+                'left_pct': 12,
+                'chart_width_pct': 83,
+                'note': 'Use: left_pct + (position_pct * chart_width_pct / 100) for absolute positioning'
+            }
+        }
+        
+        response = {
             'current_date': str(current_date),
             'doi_goal_date': str(doi_goal_date),
-            'runout_date': str(runout_date),
+            'runout_date': str(fba_runout_date),  # FBA runout (for backwards compat)
+            'total_runout_date': str(total_runout_date),  # Total inventory runout
             'doi_goal': doi_goal,
             'lead_time': lead_time,
             'fba_available_days': fba_available_days,
@@ -657,8 +1145,18 @@ def calculate_forecast_days(asin, settings=None):
             'inventory': {
                 'total': total_inv,
                 'available_fba': available_fba
-            }
+            },
+            'chart_rendering': chart_rendering,
+            # Algorithm info
+            'algorithm': 'new_product' if use_new_product_algo else 'established_product',
+            'product_age_months': product_age_months
         }
+        
+        # Add new product details if applicable
+        if new_product_details:
+            response['new_product_details'] = new_product_details
+        
+        return response
         
     finally:
         cur.close()
